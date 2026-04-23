@@ -387,6 +387,17 @@ TASK_NAME = "pubmedqa"
 ANSWER_LABELS: List[str] = ["yes", "no", "maybe"]
 ANSWER_TOKEN_TO_CANONICAL: Dict[str, str] = {"YES": "yes", "NO": "no", "MAYBE": "maybe"}
 ANSWER_CANONICAL_TO_TOKEN: Dict[str, str] = {"yes": "YES", "no": "NO", "maybe": "MAYBE"}
+MEDQA_REGIONS: List[str] = []
+MEDQA_REGION_ALIASES: Dict[str, str] = {
+    "us": "US",
+    "usa": "US",
+    "u.s.": "US",
+    "mainland": "Mainland",
+    "cn": "Mainland",
+    "china": "Mainland",
+    "taiwan": "Taiwan",
+    "tw": "Taiwan",
+}
 ANSWER_LASTLINE_RE = re.compile(
     r"^\s*(?:answer\s*[:=\-]?\s*)?ANSWER_(YES|NO|MAYBE)\b[^\w]*$",
     re.IGNORECASE,
@@ -426,6 +437,50 @@ def _parse_label_space_arg(label_space: str) -> List[str]:
     if not label_space or not label_space.strip():
         return []
     return [p.strip() for p in label_space.split(",") if p.strip()]
+
+
+def _canonicalize_medqa_region(value: Any) -> Optional[str]:
+    s = str(value).strip()
+    if not s:
+        return None
+    key = s.lower()
+    return MEDQA_REGION_ALIASES.get(key)
+
+
+def _normalize_medqa_regions_arg(medqa_regions: Any) -> List[str]:
+    if medqa_regions is None:
+        return []
+    if isinstance(medqa_regions, str):
+        raw_items = [p.strip() for p in medqa_regions.split(",") if p.strip()]
+    elif isinstance(medqa_regions, (list, tuple, set)):
+        raw_items = [str(x).strip() for x in medqa_regions if str(x).strip()]
+    else:
+        raw_items = [str(medqa_regions).strip()]
+
+    if any(x.lower() == "all" for x in raw_items):
+        return []
+
+    out: List[str] = []
+    seen = set()
+    bad = []
+    for raw in raw_items:
+        canon = _canonicalize_medqa_region(raw)
+        if canon is None:
+            bad.append(raw)
+            continue
+        if canon not in seen:
+            seen.add(canon)
+            out.append(canon)
+    if bad:
+        allowed = ", ".join(sorted(set(MEDQA_REGION_ALIASES.values())))
+        raise ValueError(f"Unsupported --medqa_regions value(s): {bad}. Allowed: {allowed}, or all.")
+    return out
+
+
+def configure_medqa_regions(medqa_regions: Any) -> List[str]:
+    global MEDQA_REGIONS
+    MEDQA_REGIONS = _normalize_medqa_regions_arg(medqa_regions)
+    return MEDQA_REGIONS
 
 
 def _normalize_label(raw: Any) -> str:
@@ -631,12 +686,22 @@ def _next_unique_id(seen: set, next_auto: int, candidate: Optional[Any]) -> Tupl
     return eid, next_auto + 1
 
 
-def load_raw_dataset(path: str, task_name: str = "") -> List[Dict[str, Any]]:
+def _infer_medqa_region_from_source_file(source_file: str) -> str:
+    parts = [p.strip().lower() for p in re.split(r"[\\/]+", os.path.normpath(source_file)) if p.strip()]
+    for part in parts:
+        canon = _canonicalize_medqa_region(part)
+        if canon is not None:
+            return canon
+    return ""
+
+
+def load_raw_dataset(path: str, task_name: str = "", medqa_regions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     effective_task = (task_name or TASK_NAME).strip().lower()
     files = _discover_data_files(path, effective_task)
     rows: List[Dict[str, Any]] = []
     seen_ids: set = set()
     next_auto_id = 0
+    medqa_regions = list(medqa_regions or [])
 
     for fp in files:
         raw = _read_json_or_jsonl(fp)
@@ -673,6 +738,7 @@ def load_raw_dataset(path: str, task_name: str = "") -> List[Dict[str, Any]]:
                 "choices": norm_choices,
                 "task_name": TASK_NAME,
                 "source_file": fp,
+                "medqa_region": _infer_medqa_region_from_source_file(fp) if effective_task == "medqa" else "",
                 "medical_task": str(ex.get("medical_task", "")),
                 "body_system": str(ex.get("body_system", "")),
                 "question_type": str(ex.get("question_type", "")),
@@ -691,6 +757,15 @@ def load_raw_dataset(path: str, task_name: str = "") -> List[Dict[str, Any]]:
             continue
         cleaned_rows.append(r)
 
+    if effective_task == "medqa" and medqa_regions:
+        wanted = set(medqa_regions)
+        filtered_rows = [r for r in cleaned_rows if r.get("medqa_region", "") in wanted]
+        if is_main_process():
+            region_counts = Counter([r.get("medqa_region", "") or "unknown" for r in cleaned_rows])
+            print(f"[DATA][MedQA] region_filter={medqa_regions} before={len(cleaned_rows)} counts={dict(region_counts)}")
+            print(f"[DATA][MedQA] kept_after_region_filter={len(filtered_rows)}")
+        cleaned_rows = filtered_rows
+
     if not cleaned_rows:
         raise ValueError(
             f"No valid rows from {path}. missing_q={dropped_missing_q} bad_label={dropped_bad_label}"
@@ -701,7 +776,7 @@ def load_raw_dataset(path: str, task_name: str = "") -> List[Dict[str, Any]]:
 
 
 def load_raw_task(path: str) -> List[Dict[str, Any]]:
-    return load_raw_dataset(path=path, task_name=TASK_NAME)
+    return load_raw_dataset(path=path, task_name=TASK_NAME, medqa_regions=MEDQA_REGIONS)
 
 
 # =========================================================
@@ -801,6 +876,42 @@ def subsample_rows(rows: List[Dict[str, Any]], max_samples: int, seed: int = 42)
     sampled = sampled[:max_samples]
     sampled.sort(key=lambda x: int(x["example_id"]))
     return sampled
+
+
+def build_split_scope_metadata(data_path: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    meta: Dict[str, Any] = {
+        "task_name": TASK_NAME,
+        "resolved_data_path": os.path.abspath(data_path),
+        "num_rows": len(rows),
+    }
+    if TASK_NAME == "medqa":
+        meta["medqa_regions"] = list(MEDQA_REGIONS)
+        meta["medqa_region_counts"] = dict(Counter([r.get("medqa_region", "") or "unknown" for r in rows]))
+    return meta
+
+
+def validate_split_scope(splits: Dict[str, Any], data_path: str) -> None:
+    meta = splits.get("dataset_scope")
+    if not isinstance(meta, dict):
+        return
+
+    expected_task = str(meta.get("task_name", "")).strip().lower()
+    if expected_task and expected_task != TASK_NAME:
+        raise RuntimeError(
+            f"Split file task mismatch: split built for {expected_task}, current task is {TASK_NAME}."
+        )
+
+    expected_regions = list(meta.get("medqa_regions", [])) if TASK_NAME == "medqa" else []
+    if TASK_NAME == "medqa" and expected_regions != list(MEDQA_REGIONS):
+        raise RuntimeError(
+            f"Split file MedQA region scope mismatch: split built with {expected_regions or ['ALL']}, "
+            f"current run uses {MEDQA_REGIONS or ['ALL']}. Reuse the same --medqa_regions or remake splits."
+        )
+
+    expected_path = str(meta.get("resolved_data_path", "")).strip()
+    current_path = os.path.abspath(data_path)
+    if expected_path and expected_path != current_path and is_main_process():
+        print(f"[WARN] split path differs: split={expected_path} current={current_path}")
 
 
 # =========================================================
@@ -1267,6 +1378,7 @@ def build_tool_sft_data_from_splits(
     set_seed(seed)
     rows = load_raw_task(data_path)
     splits = read_json(split_path)
+    validate_split_scope(splits, data_path)
     train_ids = set(splits["train_ids"])
     dev_ids = set(splits["dev_ids"])
     id2ex = {r["example_id"]: r for r in rows}
@@ -2505,6 +2617,7 @@ def train_manager_grpo_from_splits(
 
     rows = load_raw_task(data_path)
     splits = read_json(split_path)
+    validate_split_scope(splits, data_path)
     train_ids = set(splits["train_ids"])
     id2ex_full = {r["example_id"]: r for r in rows}
 
@@ -2695,6 +2808,10 @@ def main():
         choices=["pubmedqa", "medqa", "medxpertqa_text", "generic"],
     )
     parser.add_argument("--label_space", type=str, default="")
+    parser.add_argument(
+        "--medqa_regions", type=str, default="",
+        help="Comma-separated MedQA region filter. Example: US or US,Taiwan. Empty means all regions.",
+    )
 
     # split
     parser.add_argument("--split_path", type=str, default="splits_task.json")
@@ -2770,8 +2887,11 @@ def main():
         args.tool_base_model = shared
 
     configured_task, configured_labels = configure_task(args.task_name, args.label_space)
+    configured_medqa_regions = configure_medqa_regions(args.medqa_regions)
     if is_main_process():
         print(f"[TASK] task={configured_task} labels={configured_labels}")
+        if configured_task == "medqa":
+            print(f"[TASK][MedQA] regions={configured_medqa_regions or ['ALL']}")
     data_path = resolve_data_path_arg(args.data_path, configured_task)
     if is_main_process():
         print(f"[DATA] {data_path}")
@@ -2789,6 +2909,7 @@ def main():
             rows = subsample_rows(rows, max_samples=args.max_samples, seed=sample_seed)
             print(f"[SPLIT] subsampled = {len(rows)}")
         splits = make_splits(rows, test_size=args.test_size, dev_size=args.dev_size, seed=args.seed)
+        splits["dataset_scope"] = build_split_scope_metadata(data_path, rows)
         write_json(args.split_path, splits)
         print(f"[SPLIT] train/dev/test = {len(splits['train_ids'])}/{len(splits['dev_ids'])}/{len(splits['test_ids'])}")
         print(f"[SPLIT] wrote -> {args.split_path}")

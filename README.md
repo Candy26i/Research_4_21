@@ -1,143 +1,192 @@
-# Tool-Routing Research with GRPO (MedQA)
+# Tool-Routing Research with GRPO (Current Repo)
 
-Research-oriented refactor of the agentic GRPO pipeline. The goal is no longer
-"solve MedQA" — it is **to study whether RL-trained managers can learn
-non-trivial tool routing under a cost-aware shaped reward**.
+This README reflects the **current** design of `agents_routing_research_v1.py`.
 
-Core idea:
-- Manager model (trained with GRPO) chooses when and which tool to call from a
-  pool of 4 differentiated tools, or answers directly.
-- Every tool has a known **cost** and **capability tags**.
-- Shaped reward includes a small cost penalty and a routing-appropriateness
-  bonus, so correctness remains dominant but routing quality has its own
-  gradient signal.
-- We compare against **baselines** (random-route, fixed-route, no-tool, all-tools)
-  to show the learned policy is meaningfully different from trivial policies.
+Goal:
+- Train a GRPO manager to decide whether to answer directly or call one of 4 tools.
+- Make routing cost-aware: expensive tools should be used only when they improve accuracy.
+- Analyze routing behavior after training from the raw trace.
 
-Files:
-- `agents_routing_research_v1.py` — main script (SFT tools + GRPO manager + routing analysis)
-- `baselines.py` — evaluate non-learned policies on the same reward
-- `trl_multi_gpu_2gpu_bf16.yaml` — accelerate config for 2-GPU training
+Current runnable pipeline in this workspace:
+- `make_splits`
+- `build_tool_sft`
+- `train_fast_solver_tool`
+- `train_deep_reasoner_tool`
+- `train_medical_kb_tool`
+- `train_answer_critic_tool`
+- `train_manager_grpo`
+- `analyze_routing`
 
----
-
-## 1. The differentiated tool pool
-
-Unlike the earlier "4 LLM-as-tool" setup where every tool was the same base
-model doing something slightly different, this version uses **real functional
-differences** encoded in `TOOL_REGISTRY`:
-
-| Tool | Description | Cost | Capabilities |
-|---|---|---|---|
-| `fast_solver_tool` | Quick top-guess + alternatives | 1.0 | quick_answer, candidate_generation |
-| `deep_reasoner_tool` | Systematic analysis of each candidate | 10.0 | deep_reasoning, candidate_comparison, differential_dx |
-| `medical_kb_tool` | Recall definitions, MoA, guideline cut-offs | 2.0 | knowledge_recall, definitions, guidelines |
-| `answer_critic_tool` | Adversarially falsify a favored answer | 5.0 | critique, falsification, second_opinion |
-
-Costs are in arbitrary units. The shaped reward subtracts `0.01 × sum(tool_cost)`,
-so calling `deep_reasoner_tool` costs 0.10 reward — worth paying only if the
-manager believes it will flip a wrong answer to correct.
-
-Capabilities let us measure **routing appropriateness**: did the manager's
-declared `required_capabilities` in its BELIEF_STATE overlap with the chosen
-tool's `capabilities`? This is a dense, differentiable-per-completion signal
-that complements final correctness.
-
-**Note**: in this first version all 4 tools are still LLM-backed (same base
-model, different LoRA adapters). True differentiation in capability would
-require e.g. replacing `medical_kb_tool` with a real UMLS/textbook retriever.
-That is Stage 2 work.
+Important workspace note:
+- Earlier notes referenced `baselines.py`, but that file is **not present** in this repo.
 
 ---
 
-## 2. Cost-aware shaped reward breakdown
+## 1. Tool Pool
 
-`routing_aware_reward` in the main file. Max ≈ +1.45, min ≈ -1.0.
+The manager can route to 4 differentiated tools:
 
-| Component | Range | Purpose |
-|---|---|---|
-| `valid_format` | +0.10 | cheap format bonus — dense early signal |
-| **`correct_label`** | **+1.00** | dominant — routing must not override correctness |
-| `tool_call_count > 0` | +0.05 | escape "never call tool" collapse |
-| `tool_diversity_bonus` | 0 → +0.15 | reward multiple unique tools |
-| `belief_quality_bonus` | 0 → +0.10 (capped) | keep belief state non-empty |
-| `recommended_tool_alignment` | 0 or +0.05 | self-consistency: first call matches BELIEF's recommendation |
-| `routing_appropriateness` | 0 → +0.15 | required_capabilities ∩ tool.capabilities |
-| `cost_penalty` | `-0.01 × sum(cost)` | cost awareness — heart of the research |
-| `budget_penalty` | up to -many | > `MAX_MANAGER_TOOL_CALLS` calls |
-| `repeated_tool_penalty` | `-0.08 × extras` | call same tool twice |
-| `answer_critic_ordering_penalty` | -0.10 | critic called first (nothing to critique) |
-| `final_has_artifacts` | -0.25 | last turn mixes tool syntax with final answer |
-| `fake_tool_text` | -0.35 | plaintext tool-call attempt |
-| `invalid_format` | -0.05 | last line doesn't parse |
+| Tool | What it does | Cost | Capability tags |
+|---|---|---:|---|
+| `fast_solver_tool` | quick top guess + alternatives | 1.0 | `quick_answer`, `candidate_generation` |
+| `deep_reasoner_tool` | careful candidate-by-candidate analysis | 10.0 | `deep_reasoning`, `candidate_comparison`, `differential_dx` |
+| `medical_kb_tool` | factual medical recall, definitions, mechanisms, thresholds | 2.0 | `knowledge_recall`, `definitions`, `guidelines` |
+| `answer_critic_tool` | adversarially stress-test a favored answer | 5.0 | `critique`, `falsification`, `second_opinion` |
 
-Cost coefficient `0.01` is tunable (see ablations).
+The reward still makes correctness dominant, but adds:
+- a small cost penalty
+- a routing appropriateness bonus
+- a belief-state quality bonus
+- penalties for repeated tools, fake tool text, budget overrun, and bad ordering
 
 ---
 
-## 3. Full pipeline for MedQA
+## 2. Data Scope for MedQA
 
-### 3.1 Install
+`--task_name medqa --data_path medqa` now resolves to:
+
+```text
+MedQA/data_clean/questions
+```
+
+By default, that scans **all** MedQA regions found there:
+- `US`
+- `Mainland`
+- `Taiwan`
+
+If you want **US-only**, you must pass:
+
+```bash
+--medqa_regions US
+```
+
+This matters because:
+- `--max_samples` is applied **after** region filtering
+- the split file stores dataset scope metadata
+- later stages must reuse the same `--medqa_regions`, or the script will stop with a scope mismatch
+
+`--max_samples` means:
+- total number of examples before `train/dev/test` split
+- not the train set size
+
+Example with defaults:
+- `--max_samples 500 --test_size 200 --dev_size 160` -> `140 train / 160 dev / 200 test`
+- `--max_samples 1000 --test_size 200 --dev_size 160` -> `640 train / 160 dev / 200 test`
+
+---
+
+## 3. Install
 
 ```bash
 pip install "transformers>=4.53" "trl>=0.19" "datasets>=2.19" "peft>=0.11" "accelerate>=0.30"
 pip install numpy packaging requests
-# optional:
+```
+
+Optional:
+
+```bash
 pip install wandb vllm
 ```
 
-### 3.2 Data layout
+Runtime notes:
+- `vllm` is **not supported on native Windows** in this script.
+- Multi-GPU training is most practical on Linux.
+- For quick bring-up, you can still run split creation and tool-data generation on Windows.
 
-```
-3_20_research/
-├── agents_routing_research_v1.py
-├── baselines.py
-├── trl_multi_gpu_2gpu_bf16.yaml
-└── MedQA/
-    └── data_clean/
-        └── questions/
-            └── ...  *.jsonl files
-```
+PowerShell note:
+- Replace Bash line continuation `\` with PowerShell backtick `` ` ``, or put each command on one line.
 
-### 3.3 Create splits
+---
+
+## 4. Recommended Run Modes
+
+### 4.1 Smoke Run
+
+Use this to confirm the pipeline works end to end:
+- `US-only`
+- `500` total examples
+- smaller base model if needed
+
+### 4.2 Research Run
+
+Use this for the main experiment:
+- `US-only`
+- `1000` total examples
+- `Qwen/Qwen3-8B` if your GPUs can support it
+
+If you are memory-constrained, start with `Qwen/Qwen3-0.6B` for both manager and tools, then scale up.
+
+---
+
+## 5. End-to-End Commands
+
+### 5.1 Create Splits
+
+#### US-only, 500 total examples
 
 ```bash
 python agents_routing_research_v1.py \
   --stage make_splits \
   --task_name medqa \
   --data_path medqa \
-  --split_path splits_medqa_1000.json \
-  --max_samples 1000 \
-  --test_size 200 --dev_size 160 \
+  --medqa_regions US \
+  --split_path splits_medqa_us_500.json \
+  --max_samples 500 \
+  --test_size 200 \
+  --dev_size 160 \
   --seed 42
 ```
 
-On PowerShell replace `\` with `` ` `` at line ends or write everything on one line.
+#### US-only, 1000 total examples
 
-### 3.4 Build tool SFT data
+```bash
+python agents_routing_research_v1.py \
+  --stage make_splits \
+  --task_name medqa \
+  --data_path medqa \
+  --medqa_regions US \
+  --split_path splits_medqa_us_1000.json \
+  --max_samples 1000 \
+  --test_size 200 \
+  --dev_size 160 \
+  --seed 42
+```
 
-**With GPT teacher** (recommended — heuristic targets produce degenerate data
-on MedQA's 5-way choices):
+What to expect in logs:
+- a region breakdown for MedQA
+- confirmation that only `US` examples were kept
+- final train/dev/test sizes
+
+### 5.2 Build Tool SFT Data
+
+GPT teacher mode is recommended for MedQA. Weak heuristic supervision is usually too poor for 5-way MCQ training.
+
+Set teacher env vars first:
 
 ```bash
 # Bash
 export TEACHER_BASE_URL="https://api.openai.com"
 export TEACHER_API_KEY="sk-..."
 export TEACHER_MODEL="gpt-4o-mini"
+```
 
+```powershell
 # PowerShell
 $env:TEACHER_BASE_URL = "https://api.openai.com"
 $env:TEACHER_API_KEY = "sk-..."
 $env:TEACHER_MODEL = "gpt-4o-mini"
 ```
 
+Then build tool SFT data for the 1000-example US split:
+
 ```bash
 python agents_routing_research_v1.py \
   --stage build_tool_sft \
   --task_name medqa \
   --data_path medqa \
-  --split_path splits_medqa_1000.json \
-  --tool_sft_out_dir tool_sft_medqa \
+  --medqa_regions US \
+  --split_path splits_medqa_us_1000.json \
+  --tool_sft_out_dir tool_sft_medqa_us_1000 \
   --tool_variants_train 2 \
   --tool_variants_dev 1 \
   --tool_synth_mode gpt \
@@ -145,34 +194,62 @@ python agents_routing_research_v1.py \
   --tool_synth_gpt_max_retries 3
 ```
 
-API cost estimate for 640 train + 160 dev examples:
-- variants 2/1 × 4 tools = 5120 train calls + 640 dev calls ≈ **5760 calls**
-- gpt-4o-mini @ ~$0.00015/call → **~$0.86**
+Expected outputs:
+- `tool_sft_medqa_us_1000/fast_solver_tool_train.jsonl`
+- `tool_sft_medqa_us_1000/fast_solver_tool_dev.jsonl`
+- `tool_sft_medqa_us_1000/deep_reasoner_tool_train.jsonl`
+- `tool_sft_medqa_us_1000/deep_reasoner_tool_dev.jsonl`
+- `tool_sft_medqa_us_1000/medical_kb_tool_train.jsonl`
+- `tool_sft_medqa_us_1000/medical_kb_tool_dev.jsonl`
+- `tool_sft_medqa_us_1000/answer_critic_tool_train.jsonl`
+- `tool_sft_medqa_us_1000/answer_critic_tool_dev.jsonl`
 
-### 3.5 Train the 4 tools (LoRA)
+### 5.3 Train the 4 Tool Adapters
 
-Each tool trains independently. Using a for-loop:
+Each tool trains independently from the generated JSONL files.
+
+#### Bash loop
 
 ```bash
 for TOOL in fast_solver deep_reasoner medical_kb answer_critic; do
-python agents_routing_research_v1.py \
-  --stage train_${TOOL}_tool \
-  --tool_base_model Qwen/Qwen3-8B \
-  --tool_sft_out_dir tool_sft_medqa \
-  --${TOOL}_tool_out ${TOOL}_tool_medqa \
-  --tool_epochs 2 --tool_lr 2e-4 \
-  --tool_bs 1 --tool_grad_accum 8 \
-  --tool_max_seq_len 2048 \
-  --tool_use_lora
+  python agents_routing_research_v1.py \
+    --stage train_${TOOL}_tool \
+    --tool_base_model Qwen/Qwen3-8B \
+    --tool_sft_out_dir tool_sft_medqa_us_1000 \
+    --${TOOL}_tool_out ${TOOL}_tool_medqa_us_1000 \
+    --tool_epochs 2 \
+    --tool_lr 2e-4 \
+    --tool_bs 1 \
+    --tool_grad_accum 8 \
+    --tool_max_seq_len 2048 \
+    --tool_use_lora
 done
 ```
 
-Each tool produces a LoRA adapter dir (≈60MB). They all share the same base model
-at inference time (`SharedToolBase` hot-swaps adapters).
+#### PowerShell
 
-### 3.6 Train the manager with cost-aware GRPO
+Run the four stages explicitly in PowerShell:
 
-**2 GPU, no vLLM**:
+```powershell
+python agents_routing_research_v1.py --stage train_fast_solver_tool --tool_base_model Qwen/Qwen3-8B --tool_sft_out_dir tool_sft_medqa_us_1000 --fast_solver_tool_out fast_solver_tool_medqa_us_1000 --tool_epochs 2 --tool_lr 2e-4 --tool_bs 1 --tool_grad_accum 8 --tool_max_seq_len 2048 --tool_use_lora
+python agents_routing_research_v1.py --stage train_deep_reasoner_tool --tool_base_model Qwen/Qwen3-8B --tool_sft_out_dir tool_sft_medqa_us_1000 --deep_reasoner_tool_out deep_reasoner_tool_medqa_us_1000 --tool_epochs 2 --tool_lr 2e-4 --tool_bs 1 --tool_grad_accum 8 --tool_max_seq_len 2048 --tool_use_lora
+python agents_routing_research_v1.py --stage train_medical_kb_tool --tool_base_model Qwen/Qwen3-8B --tool_sft_out_dir tool_sft_medqa_us_1000 --medical_kb_tool_out medical_kb_tool_medqa_us_1000 --tool_epochs 2 --tool_lr 2e-4 --tool_bs 1 --tool_grad_accum 8 --tool_max_seq_len 2048 --tool_use_lora
+python agents_routing_research_v1.py --stage train_answer_critic_tool --tool_base_model Qwen/Qwen3-8B --tool_sft_out_dir tool_sft_medqa_us_1000 --answer_critic_tool_out answer_critic_tool_medqa_us_1000 --tool_epochs 2 --tool_lr 2e-4 --tool_bs 1 --tool_grad_accum 8 --tool_max_seq_len 2048 --tool_use_lora
+```
+
+Each stage writes one LoRA adapter directory such as:
+- `fast_solver_tool_medqa_us_1000`
+- `deep_reasoner_tool_medqa_us_1000`
+- `medical_kb_tool_medqa_us_1000`
+- `answer_critic_tool_medqa_us_1000`
+
+### 5.4 Train the GRPO Manager
+
+Important:
+- Reuse the **same** `--split_path` and `--medqa_regions` that you used in `make_splits`.
+- If you built a US-only split, you must also pass `--medqa_regions US` here.
+
+#### 2-GPU example, no vLLM
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -183,224 +260,156 @@ accelerate launch \
   --stage train_manager_grpo \
   --task_name medqa \
   --data_path medqa \
-  --split_path splits_medqa_1000.json \
+  --medqa_regions US \
+  --split_path splits_medqa_us_1000.json \
   --manager_base_model Qwen/Qwen3-8B \
   --tool_base_model Qwen/Qwen3-8B \
-  --fast_solver_tool_out   fast_solver_tool_medqa \
-  --deep_reasoner_tool_out deep_reasoner_tool_medqa \
-  --medical_kb_tool_out    medical_kb_tool_medqa \
-  --answer_critic_tool_out answer_critic_tool_medqa \
-  --manager_out manager_grpo_routing_medqa \
-  --mgr_bs 1 --mgr_grad_accum 4 \
+  --fast_solver_tool_out fast_solver_tool_medqa_us_1000 \
+  --deep_reasoner_tool_out deep_reasoner_tool_medqa_us_1000 \
+  --medical_kb_tool_out medical_kb_tool_medqa_us_1000 \
+  --answer_critic_tool_out answer_critic_tool_medqa_us_1000 \
+  --manager_out manager_grpo_routing_medqa_us_1000 \
+  --mgr_bs 1 \
+  --mgr_grad_accum 4 \
   --mgr_num_generations 8 \
-  --mgr_max_prompt_length 3000 --mgr_max_completion_length 1536 \
+  --mgr_max_prompt_length 3000 \
+  --mgr_max_completion_length 1536 \
   --mgr_temperature 0.7 \
   --grpo_beta 0.01 \
-  --mgr_use_lora --mgr_gradient_checkpointing \
-  --grpo_use_wandb --wandb_project medqa_routing_research \
-  --wandb_run_name costaware_run1
+  --mgr_use_lora \
+  --mgr_gradient_checkpointing \
+  --grpo_use_wandb \
+  --wandb_project medqa_routing_research \
+  --wandb_run_name costaware_us1000_run1
 ```
 
-Batch geometry: `1 × 2 × 4 = 8`, divisible by `num_generations=8` ✓
+Batch geometry check for the example above:
+- `per_device_bs * world_size * grad_accum`
+- `1 * 2 * 4 = 8`
+- divisible by `num_generations = 8`
 
-### 3.7 Analyze trained manager's routing
+#### Small bring-up example
+
+If you just want to confirm the manager stage starts, use a smaller model and a smaller split:
+
+```bash
+accelerate launch \
+  --config_file trl_multi_gpu_2gpu_bf16.yaml \
+  agents_routing_research_v1.py \
+  --stage train_manager_grpo \
+  --task_name medqa \
+  --data_path medqa \
+  --medqa_regions US \
+  --split_path splits_medqa_us_500.json \
+  --manager_base_model Qwen/Qwen3-0.6B \
+  --tool_base_model Qwen/Qwen3-0.6B \
+  --fast_solver_tool_out fast_solver_tool_medqa_us_500 \
+  --deep_reasoner_tool_out deep_reasoner_tool_medqa_us_500 \
+  --medical_kb_tool_out medical_kb_tool_medqa_us_500 \
+  --answer_critic_tool_out answer_critic_tool_medqa_us_500 \
+  --manager_out manager_grpo_routing_medqa_us_500 \
+  --mgr_bs 1 \
+  --mgr_grad_accum 4 \
+  --mgr_num_generations 8 \
+  --mgr_use_lora \
+  --mgr_gradient_checkpointing
+```
+
+### 5.5 Analyze Routing
 
 ```bash
 python agents_routing_research_v1.py \
   --stage analyze_routing \
-  --manager_out manager_grpo_routing_medqa
+  --manager_out manager_grpo_routing_medqa_us_1000
 ```
 
-Writes `manager_grpo_routing_medqa/routing_summary.json` and `.txt` with:
+This writes:
+- `manager_grpo_routing_medqa_us_1000/routing_summary.json`
+- `manager_grpo_routing_medqa_us_1000/routing_summary.txt`
 
+The summary includes:
 - `accuracy`
-- `avg_cost_per_completion` and `avg_cost_per_correct`
-- `routing_entropy` (raw + normalized 0–1) over first-tool choices
-- `tool_appropriateness_rate` — fraction of trained routes whose chosen tool's
-  capabilities match the manager's own declared `required_capabilities`
+- `avg_cost_per_completion`
+- `avg_cost_per_correct`
+- `routing_entropy`
+- `routing_entropy_normalized`
+- `tool_appropriateness_rate`
 - `belief_state_present_rate`
-- Per-route (`direct`, `fast_solver_tool`, `fast_solver_tool->deep_reasoner_tool`, …)
-  accuracy + average reward + average cost
-- Per-tool call frequency
+- per-route accuracy, reward, and cost
+- tool call frequencies
 
-### 3.8 Evaluate baselines for comparison
+---
+
+## 6. Minimal "What Do I Run?" Answer
+
+If you want the shortest practical path for the main experiment:
+
+1. Create a US-only split.
+2. Build tool SFT data from that split.
+3. Train the 4 tool adapters.
+4. Train the GRPO manager with the same split and region filter.
+5. Run `analyze_routing`.
+
+Concrete split command:
 
 ```bash
-python baselines.py \
-  --task_name medqa \
-  --data_path medqa \
-  --split_path splits_medqa_1000.json \
-  --split_key test_ids \
-  --manager_base_model Qwen/Qwen3-8B \
-  --tool_base_model Qwen/Qwen3-8B \
-  --fast_solver_tool_out   fast_solver_tool_medqa \
-  --deep_reasoner_tool_out deep_reasoner_tool_medqa \
-  --medical_kb_tool_out    medical_kb_tool_medqa \
-  --answer_critic_tool_out answer_critic_tool_medqa \
-  --baseline all \
-  --out_dir baselines_medqa_test
+python agents_routing_research_v1.py --stage make_splits --task_name medqa --data_path medqa --medqa_regions US --split_path splits_medqa_us_1000.json --max_samples 1000 --test_size 200 --dev_size 160 --seed 42
 ```
 
-Produces a comparative table:
+Concrete tool-data command:
 
-```
-================================================================================
-baseline             acc     mean_R    avg_cost  cost/correct   entropy
---------------------------------------------------------------------------------
-no_tool          0.xxxx     0.xxxx       0.000          0.00    0.0000
-random_route     0.xxxx     0.xxxx       x.xxx          x.xx    1.0000
-fixed_route      0.xxxx     0.xxxx      11.000         xx.xx    0.0000
-all_tools        0.xxxx     0.xxxx      18.000         xx.xx    0.0000
-================================================================================
+```bash
+python agents_routing_research_v1.py --stage build_tool_sft --task_name medqa --data_path medqa --medqa_regions US --split_path splits_medqa_us_1000.json --tool_sft_out_dir tool_sft_medqa_us_1000 --tool_variants_train 2 --tool_variants_dev 1 --tool_synth_mode gpt --tool_synth_gpt_temperature 0.2 --tool_synth_gpt_max_retries 3
 ```
 
-Your **trained manager** should (ideally) show:
-- ≥ `all_tools` accuracy (or slightly below)
-- **substantially lower** `avg_cost_per_correct` than `all_tools`
-- **higher** `tool_appropriateness_rate` than `random_route`
-- **non-degenerate** `routing_entropy` (not collapsed to one tool, not pure random)
-
-If none of these hold, the RL-trained routing isn't learning anything meaningful
-— go back and inspect the reward curve / routing_summary.
+After that, train the 4 tools and the manager with the matching paths shown above.
 
 ---
 
-## 4. What to claim in a paper, and what not to claim
+## 7. Research Notes
 
-### Valid claims
+What this setup can support:
+- cost-aware routing experiments
+- routing entropy analysis
+- tool usage distribution analysis
+- belief-state quality and routing appropriateness analysis
 
-- "Cost-aware shaped reward produces managers that achieve **similar
-  accuracy at lower cost** than fixed-policy baselines."
-- "Learned routing policies show **non-trivial conditioning** on problem type,
-  measured by tool_appropriateness_rate."
-- "Routing entropy of the trained policy sits between random (high) and
-  fixed (zero), indicating **adaptive rather than greedy** behavior."
-
-### Claims to avoid (or ablate carefully)
-
-- "Manager learns clinical reasoning" — it learns routing, not medicine.
-- "Our framework generalizes to any domain" — unless you actually eval on
-  non-medical domains.
-- "Our tools are complementary" — prove it via per-route accuracy analysis,
-  not by asserting it.
+What it does **not** currently support in this workspace:
+- built-in baseline evaluation script
+- native Windows `vllm`
 
 ---
 
-## 5. Recommended ablation experiments
+## 8. Debugging Checklist
 
-Once the main result is stable, run these. Each runs the full GRPO again but
-with one knob changed.
+If something fails, check:
 
-### A1. Cost coefficient sweep
-Vary `COST_COEF` in `routing_aware_reward` from 0.0 to 0.05.
-**Hypothesis**: at `COST_COEF=0` the manager will call expensive tools
-liberally; at high `COST_COEF` it collapses to `no_tool`. The sweet spot is
-where `avg_cost_per_correct` is minimized without accuracy drop.
+- `trl` version is at least `0.19.0`
+- `transformers` version is at least `4.53.0`
+- `--mgr_num_generations` divides `mgr_bs * world_size * mgr_grad_accum`
+- the split file and current run use the same `--medqa_regions`
+- the tool adapter directories exist before manager training
+- the OpenAI teacher env vars are set if using `--tool_synth_mode gpt`
+- `vllm` is not enabled on native Windows
 
-*Implementation*: add `--cost_coef` CLI arg, thread it into the reward fn.
+Typical mistakes:
 
-### A2. Tool-pool ablation
-Drop one tool at a time and retrain.
-**Hypothesis**: dropping `deep_reasoner_tool` hurts most on hard questions;
-dropping `answer_critic_tool` hurts least (since it's the most redundant with
-having deep_reasoner).
-
-### A3. Belief-state ablation
-Remove the `required_capabilities` field from BELIEF_STATE schema + remove
-`routing_appropriateness_bonus` from the reward.
-**Hypothesis**: routing still learns cost-reward trade-off but
-`tool_appropriateness_rate` drops to random-route level — proving that dense
-appropriateness signal is what teaches *structured* routing.
-
-### A4. Reward-component ablation
-One at a time, zero out:
-- `tool_diversity_bonus` → expect routing collapse to single cheap tool
-- `belief_quality_bonus` → BELIEF_STATE becomes empty
-- `routing_appropriateness_bonus` → routing becomes cost-only
-- `cost_penalty` → same as A1 with COEF=0
-
-### A5. Tool-count ablation
-Same reward, vary `MAX_MANAGER_TOOL_CALLS` from 1 to 5.
-**Hypothesis**: returns diminish fast after 2 calls; at 5 the manager wastes
-budget if cost is too small.
-
-### A6. Teacher-quality ablation
-Re-synthesize tool SFT data with `gpt-4o` (strong) vs `gpt-4o-mini` (weak) vs
-`weak` heuristic. Train tools on each, train manager on top of each.
-**Hypothesis**: weak teacher → tools produce low-value outputs → manager
-converges to `no_tool` baseline because tools never help.
-
-### A7. Transfer to PubMedQA / MedXpertQA
-Take the MedQA-trained manager, evaluate zero-shot on other benchmarks.
-**Hypothesis**: accuracy drops (domain shift) but *relative* routing pattern is
-preserved — the manager still prefers expensive tools on harder questions.
+- Forgetting `--medqa_regions US` in a later stage after creating a US-only split
+- Reusing `splits_medqa_1000.json` that was built from all-region MedQA
+- Training tools into one directory name and pointing manager training at another
 
 ---
 
-## 6. Debugging checklist
+## 9. Current Recommendation
 
-**Reward curve stuck at ~0.1**: all completions are getting only format bonus.
-Check the raw trace — are `ANSWER_<LABEL>` lines parsing? Is
-`fake_tool_text_attempt` triggering a lot (indicates model is writing tool
-calls in plain text instead of native tool-calling)?
+For this repo, the most consistent MedQA setup is:
+- `task_name = medqa`
+- `data_path = medqa`
+- `medqa_regions = US`
+- `max_samples = 1000`
+- `split_path = splits_medqa_us_1000.json`
 
-**Reward spikes then collapses**: GRPO policy collapse. Lower learning rate,
-raise `grpo_beta` from 0.01 to 0.02.
-
-**All completions choose `no_tool`**: cost penalty too aggressive, or tools
-are outputting garbage so they never help. Check `routing_summary.json` for
-`first_tool_distribution` — if `direct` dominates, lower `COST_COEF` or
-re-examine tool SFT quality.
-
-**All completions choose one tool (entropy=0)**: diversity bonus too small, or
-one tool is genuinely best for this benchmark. Increase `_tool_diversity_bonus`
-weights, or accept it and note in the paper.
-
-**`tool_appropriateness_rate` ≈ 0**: the manager is emitting
-`required_capabilities` but never matching it to any real tool. Check BELIEF_STATE
-examples in the raw trace — are the capability tags using a consistent
-vocabulary? The tool registry uses lowercase tags like `knowledge_recall`,
-`deep_reasoning`, etc. If the manager writes `"medical knowledge"` it won't
-match.
-
-**OOM on 2×40GB**: use vLLM server mode (see the earlier README for that).
-
----
-
-## 7. One-page research plan summary
-
-**Claim**: cost-aware shaped reward in GRPO teaches managers to route tool
-calls non-trivially.
-
-**Metric**: `avg_cost_per_correct` (minimize), `tool_appropriateness_rate`
-(maximize), `routing_entropy_normalized` (in middle range, not 0 or 1).
-
-**Baselines**: `no_tool`, `random_route`, `fixed_route`, `all_tools`.
-
-**Core ablations**: cost coefficient sweep (A1), drop tool (A2), drop belief
-(A3), drop each reward component (A4).
-
-**Transfer experiment**: train on MedQA, eval zero-shot on MedXpertQA (A7).
-
-**Paper story** (draft):
-> "We show that GRPO-trained agentic managers, given a cost-aware shaped
-> reward and a differentiated tool pool, learn adaptive routing policies that
-> achieve baseline-comparable accuracy at 2–5× lower inference cost. The
-> learned routing is conditional on problem type (measured via capability
-> alignment) rather than trivially fixed or uniform. We identify cost
-> coefficient and routing-appropriateness bonus as the two components
-> essential to this behavior."
-
----
-
-## 8. Future work (Stage 2)
-
-- Replace `medical_kb_tool` with a real retriever over UMLS / MedQA textbooks
-  (the MedQA repo ships textbooks — use those).
-- Replace `fast_solver_tool` with a genuinely smaller model (Qwen3-0.6B)
-  instead of a LoRA adapter on the same 8B base. Real capability asymmetry
-  is what makes `fast_solver` vs `deep_reasoner` meaningful.
-- Cross-domain evaluation on law/finance QA datasets.
-- In-context tool expansion: give the manager tool descriptions at test time
-  for tools it never saw in training, check if it can route to them from
-  description alone (à la Gorilla/MetaTool).
+If you only want a quick validation run:
+- keep `medqa_regions = US`
+- use `max_samples = 500`
+- optionally use `Qwen/Qwen3-0.6B` first
