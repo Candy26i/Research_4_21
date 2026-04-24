@@ -507,7 +507,7 @@
   ],
   "dataset_scope": {
     "task_name": "medqa",
-    "resolved_data_path": "C:\\Users\\yyn07\\Desktop\\MedQA\\MedQA",
+    "resolved_data_path": "MedQA",
     "num_rows": 500,
     "medqa_regions": [
       "US"
