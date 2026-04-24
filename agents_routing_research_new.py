@@ -1,13 +1,12 @@
-# agents_as_tools_four_tools_belief_v2.py
+# agents_as_tools_three_tools_belief_v2.py
 # -*- coding: utf-8 -*-
 """
-Four-tool agentic GRPO pipeline with differentiated tools for routing research.
+Three-tool agentic GRPO pipeline with differentiated tools for routing research.
 
 Tools:
   1) fast_solver_tool     - quick small-model candidate generation (cost=1.0)
   2) deep_reasoner_tool   - careful large-model reasoning over candidates (cost=10.0)
-  3) medical_kb_tool      - medical knowledge lookup: definitions, mechanisms (cost=2.0)
-  4) answer_critic_tool   - adversarial critique of a favored answer (cost=5.0)
+  3) answer_critic_tool   - adversarial critique of a favored answer (cost=5.0)
 
 Manager (trained via GRPO) must emit a BELIEF_STATE JSON block before each
 tool call or final answer. Shaped reward rewards correctness, valid format,
@@ -25,6 +24,7 @@ Fixes over the previous draft:
 
 import argparse
 import glob
+import hashlib
 import importlib
 import inspect
 import json
@@ -51,6 +51,35 @@ import numpy as np
 import torch
 import transformers
 from packaging.version import Version
+
+
+def _load_local_dotenv(dotenv_path: str = "", override: bool = False) -> None:
+    """Minimal .env loader so TEACHER_* vars work without extra dependencies."""
+    if not dotenv_path:
+        dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    path = os.path.abspath(dotenv_path)
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = value.strip()
+                if value and len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                if override or key not in os.environ:
+                    os.environ[key] = value
+    except Exception:
+        pass
+
+
+_load_local_dotenv()
 
 DATASETS_AVAILABLE = False
 DATASETS_IMPORT_ERROR: Optional[Exception] = None
@@ -398,6 +427,11 @@ MEDQA_REGION_ALIASES: Dict[str, str] = {
     "taiwan": "Taiwan",
     "tw": "Taiwan",
 }
+MEDQA_REGION_QBANK_FILENAMES: Dict[str, str] = {
+    "US": "US_qbank.jsonl",
+    "Mainland": "chinese_qbank.jsonl",
+    "Taiwan": "taiwanese_qbank.jsonl",
+}
 ANSWER_LASTLINE_RE = re.compile(
     r"^\s*(?:answer\s*[:=\-]?\s*)?ANSWER_(YES|NO|MAYBE)\b[^\w]*$",
     re.IGNORECASE,
@@ -573,7 +607,103 @@ def resolve_data_path_arg(data_path_arg: str, task_name: str) -> str:
     return arg
 
 
-def _discover_data_files(path: str, task_name: str) -> List[str]:
+def _medqa_region_dir_candidates(path: str, requested_regions: Optional[List[str]] = None) -> List[Tuple[str, str]]:
+    p = os.path.abspath(path)
+    if not os.path.isdir(p):
+        return []
+
+    direct_region = _canonicalize_medqa_region(os.path.basename(p))
+    if direct_region is not None:
+        return [(direct_region, p)]
+
+    questions_root = p
+    if os.path.basename(p).lower() != "questions":
+        nested = os.path.join(p, "data_clean", "questions")
+        if os.path.isdir(nested):
+            questions_root = nested
+
+    regions = list(requested_regions or [])
+    if not regions:
+        discovered: List[str] = []
+        seen = set()
+        for name in sorted(os.listdir(questions_root)):
+            region = _canonicalize_medqa_region(name)
+            full = os.path.join(questions_root, name)
+            if region is None or not os.path.isdir(full) or region in seen:
+                continue
+            seen.add(region)
+            discovered.append(region)
+        regions = discovered
+
+    out: List[Tuple[str, str]] = []
+    for region in regions:
+        region_dir = os.path.join(questions_root, region)
+        if os.path.isdir(region_dir):
+            out.append((region, region_dir))
+    return out
+
+
+def _canonical_medqa_region_files(region: str, region_dir: str) -> List[str]:
+    lower = region.lower()
+    clean_candidates = [
+        os.path.join(region_dir, f"{lower}_clean_all.jsonl"),
+        os.path.join(region_dir, "clean_all.jsonl"),
+    ]
+    for fp in clean_candidates:
+        if os.path.isfile(fp):
+            return [fp]
+
+    split_candidates = [
+        os.path.join(region_dir, "train.jsonl"),
+        os.path.join(region_dir, "dev.jsonl"),
+        os.path.join(region_dir, "test.jsonl"),
+    ]
+    split_files = [fp for fp in split_candidates if os.path.isfile(fp)]
+    if split_files:
+        return split_files
+
+    qbank_name = MEDQA_REGION_QBANK_FILENAMES.get(region, "")
+    if qbank_name:
+        qbank_fp = os.path.join(region_dir, qbank_name)
+        if os.path.isfile(qbank_fp):
+            return [qbank_fp]
+
+    fallback = sorted([
+        fp for fp in glob.glob(os.path.join(region_dir, "*.jsonl"))
+        if os.path.isfile(fp)
+        and os.path.basename(fp) not in {".DS_Store"}
+        and "4_options" not in fp
+        and "metamap" not in fp.lower()
+    ])
+    return fallback[:1]
+
+
+def _discover_medqa_files(path: str, requested_regions: Optional[List[str]] = None) -> List[str]:
+    p = os.path.abspath(path)
+    if os.path.isfile(p):
+        return [p]
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f"Data path not found: {path}")
+
+    files: List[str] = []
+    for region, region_dir in _medqa_region_dir_candidates(p, requested_regions=requested_regions):
+        files.extend(_canonical_medqa_region_files(region, region_dir))
+    if files:
+        return files
+
+    # Final fallback for unusual layouts: still avoid obviously derived helper files.
+    fallback = sorted([
+        fp for fp in glob.glob(os.path.join(p, "**", "*.jsonl"), recursive=True)
+        if os.path.isfile(fp)
+        and "4_options" not in fp
+        and "metamap" not in fp.lower()
+    ])
+    if fallback:
+        return fallback
+    raise FileNotFoundError(f"No canonical MedQA json/jsonl under: {path}")
+
+
+def _discover_data_files(path: str, task_name: str, medqa_regions: Optional[List[str]] = None) -> List[str]:
     p = os.path.abspath(path)
     if os.path.isfile(p):
         return [p]
@@ -596,17 +726,7 @@ def _discover_data_files(path: str, task_name: str) -> List[str]:
         raise FileNotFoundError(f"No PubMedQA json under: {path}")
 
     if t == "medqa":
-        primary = sorted(glob.glob(os.path.join(p, "**", "questions", "**", "*.jsonl"), recursive=True))
-        primary = [x for x in primary if os.path.isfile(x)]
-        if primary:
-            return primary
-        files = []
-        for pat in [os.path.join(p, "**", "*.jsonl"), os.path.join(p, "**", "*.json")]:
-            files.extend(glob.glob(pat, recursive=True))
-        files = sorted([x for x in files if os.path.isfile(x)])
-        if files:
-            return files
-        raise FileNotFoundError(f"No MedQA json/jsonl under: {path}")
+        return _discover_medqa_files(p, requested_regions=medqa_regions)
 
     if t == "medxpertqa_text":
         preferred = [
@@ -697,7 +817,7 @@ def _infer_medqa_region_from_source_file(source_file: str) -> str:
 
 def load_raw_dataset(path: str, task_name: str = "", medqa_regions: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     effective_task = (task_name or TASK_NAME).strip().lower()
-    files = _discover_data_files(path, effective_task)
+    files = _discover_data_files(path, effective_task, medqa_regions=medqa_regions)
     rows: List[Dict[str, Any]] = []
     seen_ids: set = set()
     next_auto_id = 0
@@ -728,17 +848,27 @@ def load_raw_dataset(path: str, task_name: str = "", medqa_regions: Optional[Lis
             if not context:
                 context = _build_default_context(ex, norm_choices, effective_task)
             gt_raw = ex.get("ground_truth", ex.get("answer_idx", ex.get("label", ex.get("answer_label", ""))))
+            answer_field = str(ex.get("answer", "")).strip()
+            if not str(gt_raw).strip() and answer_field in norm_choices:
+                gt_raw = answer_field
             gt = _normalize_label(gt_raw)
+            answer_text = answer_field
+            if answer_text in norm_choices:
+                answer_text = str(norm_choices.get(answer_text, "")).strip()
+            if not answer_text and gt and gt in norm_choices:
+                answer_text = str(norm_choices.get(gt, "")).strip()
             rows.append({
                 "example_id": eid,
                 "raw_id": str(ex.get("id", ex.get("example_id", eid))),
                 "question": question,
                 "context": context,
                 "ground_truth": gt,
+                "answer_text": answer_text,
                 "choices": norm_choices,
                 "task_name": TASK_NAME,
                 "source_file": fp,
                 "medqa_region": _infer_medqa_region_from_source_file(fp) if effective_task == "medqa" else "",
+                "meta_info": str(ex.get("meta_info", "")),
                 "medical_task": str(ex.get("medical_task", "")),
                 "body_system": str(ex.get("body_system", "")),
                 "question_type": str(ex.get("question_type", "")),
@@ -878,11 +1008,152 @@ def subsample_rows(rows: List[Dict[str, Any]], max_samples: int, seed: int = 42)
     return sampled
 
 
+def _row_sample_uid(row: Dict[str, Any]) -> str:
+    payload = {
+        "question": str(row.get("question", "")).strip(),
+        "ground_truth": str(row.get("ground_truth", "")).strip(),
+        "answer_text": str(row.get("answer_text", row.get("answer", ""))).strip(),
+        "choices": {k: v for k, v in _sorted_choice_items(row.get("choices", row.get("options", {})) or {})},
+    }
+    raw = dumps_json(payload)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _split_example_from_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    options = dict(row.get("choices", row.get("options", {})) or {})
+    answer_idx = str(row.get("ground_truth", row.get("answer_idx", ""))).strip()
+    answer_text = str(row.get("answer_text", row.get("answer", ""))).strip()
+    if not answer_text and answer_idx and answer_idx in options:
+        answer_text = str(options.get(answer_idx, "")).strip()
+    return {
+        "example_id": int(row.get("example_id", -1)),
+        "sample_uid": _row_sample_uid(row),
+        "raw_id": str(row.get("raw_id", row.get("example_id", ""))),
+        "question": str(row.get("question", "")).strip(),
+        "answer": answer_text,
+        "answer_idx": answer_idx,
+        "ground_truth": answer_idx,
+        "options": options,
+        "choices": options,
+        "context": str(row.get("context", "")).strip(),
+        "task_name": str(row.get("task_name", TASK_NAME)).strip(),
+        "source_file": str(row.get("source_file", "")).strip(),
+        "medqa_region": str(row.get("medqa_region", "")).strip(),
+        "meta_info": str(row.get("meta_info", "")).strip(),
+        "medical_task": str(row.get("medical_task", "")).strip(),
+        "body_system": str(row.get("body_system", "")).strip(),
+        "question_type": str(row.get("question_type", "")).strip(),
+    }
+
+
+def attach_split_examples(splits: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    id2row = {int(r["example_id"]): r for r in rows}
+    out = dict(splits)
+    for split_name in ["train", "dev", "test"]:
+        ids = [int(x) for x in splits.get(f"{split_name}_ids", [])]
+        out[f"{split_name}_examples"] = [
+            _split_example_from_row(id2row[eid])
+            for eid in ids
+            if eid in id2row
+        ]
+    return out
+
+
+def _normalize_split_example(ex: Dict[str, Any], fallback_id: int) -> Dict[str, Any]:
+    choices = ex.get("choices", ex.get("options", {}))
+    if not isinstance(choices, dict):
+        choices = {}
+    norm_choices = {str(k).strip(): str(v).strip() for k, v in choices.items() if str(k).strip()}
+    answer_idx = str(ex.get("ground_truth", ex.get("answer_idx", ""))).strip()
+    answer_text = str(ex.get("answer_text", ex.get("answer", ""))).strip()
+    if not answer_text and answer_idx in norm_choices:
+        answer_text = str(norm_choices.get(answer_idx, "")).strip()
+    sample = {
+        "example_id": int(ex.get("example_id", fallback_id)),
+        "sample_uid": str(ex.get("sample_uid", "")).strip(),
+        "raw_id": str(ex.get("raw_id", ex.get("example_id", fallback_id))),
+        "question": str(ex.get("question", "")).strip(),
+        "context": str(ex.get("context", "")).strip(),
+        "ground_truth": answer_idx,
+        "answer_text": answer_text,
+        "choices": norm_choices,
+        "task_name": str(ex.get("task_name", TASK_NAME)).strip() or TASK_NAME,
+        "source_file": str(ex.get("source_file", "")).strip(),
+        "medqa_region": str(ex.get("medqa_region", "")).strip(),
+        "meta_info": str(ex.get("meta_info", "")).strip(),
+        "medical_task": str(ex.get("medical_task", "")).strip(),
+        "body_system": str(ex.get("body_system", "")).strip(),
+        "question_type": str(ex.get("question_type", "")).strip(),
+    }
+    if not sample["sample_uid"]:
+        sample["sample_uid"] = _row_sample_uid(sample)
+    return sample
+
+
+def get_split_examples(splits: Dict[str, Any], split_name: str) -> List[Dict[str, Any]]:
+    raw = splits.get(f"{split_name}_examples", [])
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for i, ex in enumerate(raw):
+        if isinstance(ex, dict):
+            out.append(_normalize_split_example(ex, fallback_id=i))
+    return out
+
+
+def get_rows_for_split(splits: Dict[str, Any], split_name: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    embedded = get_split_examples(splits, split_name)
+    if embedded:
+        return embedded
+    id2row = {int(r["example_id"]): r for r in rows}
+    return [
+        id2row[int(eid)]
+        for eid in splits.get(f"{split_name}_ids", [])
+        if int(eid) in id2row
+    ]
+
+
+def resolve_tool_base_models_for_stage(
+    stage_name: str,
+    default_tool_base_model: str = "",
+    fast_solver_base_model: str = "",
+    deep_reasoner_base_model: str = "",
+    answer_critic_base_model: str = "",
+) -> Dict[str, str]:
+    stage = str(stage_name or "").strip()
+    default_model = str(default_tool_base_model or "").strip()
+    fast_model = str(fast_solver_base_model or "").strip()
+    deep_model = str(deep_reasoner_base_model or "").strip()
+    critic_model = str(answer_critic_base_model or "").strip()
+
+    out: Dict[str, str] = {}
+
+    if stage in {"train_fast_solver_tool", "train_manager_grpo"}:
+        if not fast_model:
+            raise ValueError(f"{stage} requires --fast_solver_base_model.")
+        out["fast_solver_tool"] = fast_model
+
+    if stage in {"train_deep_reasoner_tool", "train_manager_grpo"}:
+        model_name = deep_model or default_model
+        if not model_name:
+            raise ValueError(f"{stage} requires --tool_base_model or --deep_reasoner_base_model.")
+        out["deep_reasoner_tool"] = model_name
+
+    if stage in {"train_answer_critic_tool", "train_manager_grpo"}:
+        model_name = critic_model or default_model
+        if not model_name:
+            raise ValueError(f"{stage} requires --tool_base_model or --answer_critic_base_model.")
+        out["answer_critic_tool"] = model_name
+
+    return out
+
+
 def build_split_scope_metadata(data_path: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     meta: Dict[str, Any] = {
         "task_name": TASK_NAME,
         "resolved_data_path": os.path.abspath(data_path),
         "num_rows": len(rows),
+        "source_files": sorted(set([str(r.get("source_file", "")).strip() for r in rows if str(r.get("source_file", "")).strip()])),
     }
     if TASK_NAME == "medqa":
         meta["medqa_regions"] = list(MEDQA_REGIONS)
@@ -902,11 +1173,11 @@ def validate_split_scope(splits: Dict[str, Any], data_path: str) -> None:
         )
 
     expected_regions = list(meta.get("medqa_regions", [])) if TASK_NAME == "medqa" else []
-    # if TASK_NAME == "medqa" and expected_regions != list(MEDQA_REGIONS):
-    #     raise RuntimeError(
-    #         f"Split file MedQA region scope mismatch: split built with {expected_regions or ['ALL']}, "
-    #         f"current run uses {MEDQA_REGIONS or ['ALL']}. Reuse the same --medqa_regions or remake splits."
-    #     )
+    if TASK_NAME == "medqa" and expected_regions != list(MEDQA_REGIONS):
+        raise RuntimeError(
+            f"Split file MedQA region scope mismatch: split built with {expected_regions or ['ALL']}, "
+            f"current run uses {MEDQA_REGIONS or ['ALL']}. Reuse the same --medqa_regions or remake splits."
+        )
 
     expected_path = str(meta.get("resolved_data_path", "")).strip()
     current_path = os.path.abspath(data_path)
@@ -1022,18 +1293,6 @@ DEEP_REASONER_SYS = (
     "  confidence: float 0.0~1.0\n"
 )
 
-MEDICAL_KB_SYS = (
-    "You are a medical knowledge lookup tool.\n"
-    "Given a medical question, identify the key medical terms (diseases, drugs, anatomy, "
-    "procedures) and recall authoritative textbook definitions or mechanisms. "
-    "Return ONLY a JSON object with keys:\n"
-    "  key_terms: list[str]\n"
-    "  term_definitions: list[{term:str, definition:str}] (one per key_term, <=200 chars each)\n"
-    "  relevant_mechanisms: list[str] (pathophysiology, drug MOA, anatomy relations)\n"
-    "  guidelines_or_norms: list[str] (standard of care, cut-off values, etc.)\n"
-    "  confidence: float 0.0~1.0\n"
-)
-
 ANSWER_CRITIC_SYS = (
     "You are an answer critic tool.\n"
     "Given a medical question, the candidate answers, and a currently-favored answer, "
@@ -1081,24 +1340,6 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
         "cost": 10.0,
         "capabilities": ["deep_reasoning", "candidate_comparison", "differential_dx"],
         "max_new_tokens": 600,
-    },
-    "medical_kb_tool": {
-        "system_prompt": MEDICAL_KB_SYS,
-        "description": (
-            "A medical knowledge lookup tool: recalls textbook definitions, drug "
-            "mechanisms, anatomical relations, guideline cut-offs."
-        ),
-        "when_to_use": (
-            "When the question hinges on precise medical facts (drug MOA, normal lab "
-            "values, guideline thresholds, anatomical landmarks)."
-        ),
-        "when_not_to_use": (
-            "For patient-specific reasoning or for questions that are primarily about "
-            "clinical judgment rather than recall."
-        ),
-        "cost": 2.0,
-        "capabilities": ["knowledge_recall", "definitions", "guidelines"],
-        "max_new_tokens": 400,
     },
     "answer_critic_tool": {
         "system_prompt": ANSWER_CRITIC_SYS,
@@ -1252,31 +1493,6 @@ def _normalize_deep_reasoner(obj: Dict[str, Any]) -> Dict[str, Any]:
     return obj
 
 
-def _normalize_medical_kb(obj: Dict[str, Any]) -> Dict[str, Any]:
-    kt = obj.get("key_terms", [])
-    obj["key_terms"] = [str(x)[:80] for x in kt[:8]] if isinstance(kt, list) else []
-    td = obj.get("term_definitions", [])
-    norm_td = []
-    if isinstance(td, list):
-        for it in td[:8]:
-            if isinstance(it, dict):
-                norm_td.append({
-                    "term": str(it.get("term", ""))[:80],
-                    "definition": str(it.get("definition", ""))[:200],
-                })
-    obj["term_definitions"] = norm_td
-    rm = obj.get("relevant_mechanisms", [])
-    obj["relevant_mechanisms"] = [str(x)[:200] for x in rm[:5]] if isinstance(rm, list) else []
-    gn = obj.get("guidelines_or_norms", [])
-    obj["guidelines_or_norms"] = [str(x)[:200] for x in gn[:5]] if isinstance(gn, list) else []
-    try:
-        obj["confidence"] = float(obj.get("confidence", 0.6))
-    except Exception:
-        obj["confidence"] = 0.6
-    obj["confidence"] = max(0.0, min(1.0, obj["confidence"]))
-    return obj
-
-
 def _normalize_answer_critic(obj: Dict[str, Any]) -> Dict[str, Any]:
     fw = obj.get("favored_answer_weaknesses", [])
     obj["favored_answer_weaknesses"] = [str(x)[:200] for x in fw[:3]] if isinstance(fw, list) else []
@@ -1336,16 +1552,6 @@ def _weak_tool_target(tool_name: str, q: str, ctx: str, candidates: List[Dict[st
             "confidence": 0.3,
         })
 
-    if tool_name == "medical_kb_tool":
-        terms = tokenize_words(q)[:5]
-        return _normalize_medical_kb({
-            "key_terms": terms,
-            "term_definitions": [{"term": t, "definition": "Definition unavailable in weak mode."} for t in terms[:3]],
-            "relevant_mechanisms": ["Mechanism not recalled in weak supervision mode."],
-            "guidelines_or_norms": [],
-            "confidence": 0.2,
-        })
-
     if tool_name == "answer_critic_tool":
         alts = []
         if len(choice_labels) >= 2:
@@ -1376,12 +1582,15 @@ def build_tool_sft_data_from_splits(
     gpt_max_retries: int = 3,
 ) -> Dict[str, Tuple[str, str]]:
     set_seed(seed)
-    rows = load_raw_task(data_path)
     splits = read_json(split_path)
     validate_split_scope(splits, data_path)
-    train_ids = set(splits["train_ids"])
-    dev_ids = set(splits["dev_ids"])
-    id2ex = {r["example_id"]: r for r in rows}
+    train_rows = get_split_examples(splits, "train")
+    dev_rows = get_split_examples(splits, "dev")
+    if not train_rows or not dev_rows:
+        raise RuntimeError(
+            "Split file must contain embedded train_examples and dev_examples. "
+            "Remake splits with the current make_splits stage."
+        )
 
     # Teacher setup
     teacher: Optional[OpenAICompatClient] = None
@@ -1420,8 +1629,8 @@ def build_tool_sft_data_from_splits(
         # weak mode
         return _weak_tool_target(tool_name, q, ctx, candidates, evidence, choices=choices)
 
-    def add_one(eid: int, variants: int, is_dev: bool) -> None:
-        ex = id2ex[eid]
+    def add_one(ex: Dict[str, Any], variants: int, is_dev: bool) -> None:
+        eid = int(ex["example_id"])
         q, ctx = ex["question"], ex["context"]
         choices = ex.get("choices", {}) or {}
         base_rng = random.Random(seed * 100000 + eid)
@@ -1434,11 +1643,10 @@ def build_tool_sft_data_from_splits(
                 try:
                     obj = _make_tool_target(tool_name, q, ctx, candidates, evidence, choices)
                 except Exception as e:
-                    if synth_mode == "gpt":
-                        print(f"[GPT SYNTH WARN] eid={eid} tool={tool_name} -> weak fallback. {type(e).__name__}: {e}")
-                        obj = _weak_tool_target(tool_name, q, ctx, candidates, evidence, choices=choices)
-                    else:
-                        raise
+                    raise RuntimeError(
+                        f"Tool SFT target generation failed: eid={eid} tool={tool_name} "
+                        f"{type(e).__name__}: {e}"
+                    ) from e
                 user = _tool_input_user_message(tool_name, eid, q, ctx, choices)
                 row = {
                     "example_id": eid,
@@ -1450,17 +1658,17 @@ def build_tool_sft_data_from_splits(
                 else:
                     out_map[tool_name][0].append(row)
 
-    total_train = len(train_ids)
-    total_dev = len(dev_ids)
+    total_train = len(train_rows)
+    total_dev = len(dev_rows)
     if synth_mode == "gpt":
-        print(f"[GPT SYNTH] will make ~{total_train * variants_train * 4 + total_dev * variants_dev * 4} API calls")
+        print(f"[GPT SYNTH] will make ~{total_train * variants_train * len(TOOL_ORDER) + total_dev * variants_dev * len(TOOL_ORDER)} API calls")
 
-    for i, eid in enumerate(sorted(train_ids)):
-        add_one(eid, variants_train, is_dev=False)
+    for i, ex in enumerate(sorted(train_rows, key=lambda item: int(item["example_id"]))):
+        add_one(ex, variants_train, is_dev=False)
         if synth_mode == "gpt" and (i + 1) % 25 == 0:
             print(f"[GPT SYNTH] train progress: {i+1}/{total_train}")
-    for i, eid in enumerate(sorted(dev_ids)):
-        add_one(eid, variants_dev, is_dev=True)
+    for i, ex in enumerate(sorted(dev_rows, key=lambda item: int(item["example_id"]))):
+        add_one(ex, variants_dev, is_dev=True)
         if synth_mode == "gpt" and (i + 1) % 25 == 0:
             print(f"[GPT SYNTH] dev progress: {i+1}/{total_dev}")
 
@@ -1601,7 +1809,7 @@ TOOLS_TAG_RE = re.compile(r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL)
 TOOL_CALLS_FIELD_RE = re.compile(r'"tool_calls"\s*:', re.IGNORECASE)
 # FIX: require ( or { after tool name to avoid false positives on explanations
 PLAIN_TOOL_NAME_RE = re.compile(
-    r"^\s*(fast_solver_tool|deep_reasoner_tool|medical_kb_tool|answer_critic_tool)\s*[\(\{]",
+    r"^\s*(fast_solver_tool|deep_reasoner_tool|answer_critic_tool)\s*[\(\{]",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -1830,13 +2038,20 @@ _shared_tool_base: Optional[SharedToolBase] = None
 _tool_agents: Dict[str, Any] = {}
 
 
-def init_tool_agents(tool_base_model: str, adapter_paths: Dict[str, str], device: str):
+def init_tool_agents(tool_base_models: Dict[str, str], adapter_paths: Dict[str, str], device: str):
     global _shared_tool_base, _tool_agents
-    can_share = bool(PEFT_AVAILABLE and all(adapter_paths.get(name) for name in TOOL_ORDER))
+    shared_model_names = {str(tool_base_models.get(name, "")).strip() for name in TOOL_ORDER}
+    can_share = bool(
+        PEFT_AVAILABLE
+        and all(adapter_paths.get(name) for name in TOOL_ORDER)
+        and len(shared_model_names) == 1
+        and "" not in shared_model_names
+    )
     if can_share and _shared_tool_base is None:
         try:
+            shared_model_name = next(iter(shared_model_names))
             _shared_tool_base = SharedToolBase(
-                tool_base_model=tool_base_model,
+                tool_base_model=shared_model_name,
                 adapter_paths=adapter_paths,
                 device=device,
             )
@@ -1859,7 +2074,7 @@ def init_tool_agents(tool_base_model: str, adapter_paths: Dict[str, str], device
         info = TOOL_REGISTRY.get(tool_name, {})
         max_new = int(info.get("max_new_tokens", 420))
         _tool_agents[tool_name] = FrozenAgent(
-            tool_base_model=tool_base_model,
+            tool_base_model=str(tool_base_models.get(tool_name, "")).strip(),
             adapter_path=adapter_paths.get(tool_name),
             device=device,
             max_new_tokens=max_new,
@@ -1899,9 +2114,6 @@ def _fallback_tool_output(tool_name: str, q: str, ctx: str, candidates: List[Dic
     elif tool_name == "deep_reasoner_tool":
         obj["remaining_uncertainty"] = "Tool output failed to parse; answer unavailable."
         obj["confidence"] = 0.0
-    elif tool_name == "medical_kb_tool":
-        obj["guidelines_or_norms"] = (obj.get("guidelines_or_norms") or []) + ["invalid_tool_output"]
-        obj["confidence"] = 0.0
     elif tool_name == "answer_critic_tool":
         obj["favored_answer_weaknesses"] = (obj.get("favored_answer_weaknesses") or []) + ["invalid_tool_output"]
         obj["confidence"] = 0.0
@@ -1914,8 +2126,6 @@ def _normalize_tool_output(tool_name: str, obj: Dict[str, Any]) -> Dict[str, Any
         return _normalize_fast_solver(obj)
     if tool_name == "deep_reasoner_tool":
         return _normalize_deep_reasoner(obj)
-    if tool_name == "medical_kb_tool":
-        return _normalize_medical_kb(obj)
     if tool_name == "answer_critic_tool":
         return _normalize_answer_critic(obj)
     raise ValueError(f"Unknown tool_name={tool_name}")
@@ -1995,23 +2205,6 @@ def deep_reasoner_tool(example_id: int) -> str:
         remaining_uncertainty, confidence.
     """
     return _run_tool("deep_reasoner_tool", example_id)
-
-
-def medical_kb_tool(example_id: int) -> str:
-    """Medical knowledge lookup. Retrieves textbook definitions, drug mechanisms,
-    anatomical relations, guideline thresholds.
-
-    Use when the question hinges on precise medical facts (drug MOA, lab cut-offs,
-    guideline values) rather than patient-specific reasoning.
-
-    Args:
-        example_id: dataset example id from the user message.
-
-    Returns:
-        JSON string with key_terms, term_definitions, relevant_mechanisms,
-        guidelines_or_norms, confidence.
-    """
-    return _run_tool("medical_kb_tool", example_id)
 
 
 def answer_critic_tool(example_id: int) -> str:
@@ -2566,8 +2759,10 @@ def train_manager_grpo_from_splits(
     extractor_adapter_unused: Optional[str] = None,  # deprecated placeholder
     fast_solver_adapter: str = "",
     deep_reasoner_adapter: str = "",
-    medical_kb_adapter: str = "",
     answer_critic_adapter: str = "",
+    fast_solver_base_model: str = "",
+    deep_reasoner_base_model: str = "",
+    answer_critic_base_model: str = "",
     seed: int = 42,
     per_device_train_bs: int = 1,
     grad_accum: int = 4,
@@ -2579,7 +2774,7 @@ def train_manager_grpo_from_splits(
     fail_buffer_jsonl: str = "",
     raw_trace_jsonl: str = "",
     use_wandb: bool = False,
-    wandb_project: str = "agents_as_tools_four_grpo",
+    wandb_project: str = "agents_as_tools_three_grpo",
     wandb_entity: str = "",
     wandb_run_name: str = "",
     wandb_mode: str = "online",
@@ -2615,14 +2810,18 @@ def train_manager_grpo_from_splits(
     FAIL_BUFFER_JSONL = (fail_buffer_jsonl.strip() or os.path.join(save_dir, "fail_buffer.jsonl"))
     RAW_TRACE_JSONL = (raw_trace_jsonl.strip() or os.path.join(save_dir, "train_raw_trace.jsonl"))
 
-    rows = load_raw_task(data_path)
     splits = read_json(split_path)
     validate_split_scope(splits, data_path)
-    train_ids = set(splits["train_ids"])
-    id2ex_full = {r["example_id"]: r for r in rows}
+    train_rows = get_split_examples(splits, "train")
+    if not train_rows:
+        raise RuntimeError(
+            "Split file must contain embedded train_examples. "
+            "Remake splits with the current make_splits stage."
+        )
+    train_ids = {int(r["example_id"]) for r in train_rows}
 
     ID2EX.clear()
-    for r in rows:
+    for r in train_rows:
         ID2EX[int(r["example_id"])] = {"question": r["question"], "context": r["context"], "choices": r.get("choices", {})}
 
     ALLOWED_TOOL_IDS = set(train_ids)
@@ -2633,10 +2832,18 @@ def train_manager_grpo_from_splits(
     adapter_paths = {
         "fast_solver_tool": fast_solver_adapter,
         "deep_reasoner_tool": deep_reasoner_adapter,
-        "medical_kb_tool": medical_kb_adapter,
         "answer_critic_tool": answer_critic_adapter,
     }
-    init_tool_agents(tool_base_model, adapter_paths=adapter_paths, device=runtime_device())
+    tool_base_models = resolve_tool_base_models_for_stage(
+        stage_name="train_manager_grpo",
+        default_tool_base_model=tool_base_model,
+        fast_solver_base_model=fast_solver_base_model,
+        deep_reasoner_base_model=deep_reasoner_base_model,
+        answer_critic_base_model=answer_critic_base_model,
+    )
+    if is_main_process():
+        print(f"[TOOLS] base_models={tool_base_models}")
+    init_tool_agents(tool_base_models, adapter_paths=adapter_paths, device=runtime_device())
 
     if use_wandb:
         try:
@@ -2649,7 +2856,7 @@ def train_manager_grpo_from_splits(
             os.environ["WANDB_ENTITY"] = wandb_entity.strip()
         os.environ["WANDB_MODE"] = (wandb_mode or "online").strip().lower()
         _save_dir_tag = os.path.basename(save_dir.rstrip("/\\"))
-        run_name = wandb_run_name.strip() or f"grpo4_{_save_dir_tag}_{int(time.time())}"
+        run_name = wandb_run_name.strip() or f"grpo3_{_save_dir_tag}_{int(time.time())}"
         os.environ["WANDB_NAME"] = run_name
         if is_main_process():
             print(f"[WANDB] project={os.environ.get('WANDB_PROJECT','')} run={run_name}")
@@ -2674,8 +2881,7 @@ def train_manager_grpo_from_splits(
     if manager_tok.pad_token_id is None and manager_tok.eos_token_id is not None:
         manager_tok.pad_token_id = manager_tok.eos_token_id
 
-    train_rows = [id2ex_full[eid] for eid in sorted(train_ids)]
-    dataset = Dataset.from_list(train_rows)
+    dataset = Dataset.from_list(sorted(train_rows, key=lambda item: int(item["example_id"])))
 
     def preprocess(ex: Dict[str, Any]) -> Dict[str, Any]:
         eid = int(ex["example_id"])
@@ -2769,7 +2975,7 @@ def train_manager_grpo_from_splits(
         "train_dataset": train_dataset,
         "reward_funcs": [routing_aware_reward],
         "rollout_func": None,
-        "tools": [fast_solver_tool, deep_reasoner_tool, medical_kb_tool, answer_critic_tool],
+        "tools": [fast_solver_tool, deep_reasoner_tool, answer_critic_tool],
     }
     trainer_kwargs.update(_trainer_processing_kwargs(manager_tok))
     if is_main_process():
@@ -2795,13 +3001,16 @@ def main():
         choices=[
             "make_splits", "build_tool_sft",
             "train_fast_solver_tool", "train_deep_reasoner_tool",
-            "train_medical_kb_tool", "train_answer_critic_tool",
+            "train_answer_critic_tool",
             "train_manager_grpo", "analyze_routing",
         ],
     )
     parser.add_argument("--base_model", type=str, default="")
     parser.add_argument("--manager_base_model", type=str, default="Qwen/Qwen3-0.6B")
-    parser.add_argument("--tool_base_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--tool_base_model", type=str, default="")
+    parser.add_argument("--fast_solver_base_model", type=str, default="")
+    parser.add_argument("--deep_reasoner_base_model", type=str, default="")
+    parser.add_argument("--answer_critic_base_model", type=str, default="")
     parser.add_argument("--data_path", type=str, default="")
     parser.add_argument(
         "--task_name", type=str, default="pubmedqa",
@@ -2822,7 +3031,7 @@ def main():
     parser.add_argument("--sample_seed", type=int, default=-1)
 
     # tool SFT data
-    parser.add_argument("--tool_sft_out_dir", type=str, default="tool_sft_data_four")
+    parser.add_argument("--tool_sft_out_dir", type=str, default="tool_sft_data_three")
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--tool_variants_train", type=int, default=3)
     parser.add_argument("--tool_variants_dev", type=int, default=2)
@@ -2844,11 +3053,10 @@ def main():
     parser.add_argument("--tool_use_lora", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fast_solver_tool_out", type=str, default="fast_solver_tool_adapter")
     parser.add_argument("--deep_reasoner_tool_out", type=str, default="deep_reasoner_tool_adapter")
-    parser.add_argument("--medical_kb_tool_out", type=str, default="medical_kb_tool_adapter")
     parser.add_argument("--answer_critic_tool_out", type=str, default="answer_critic_tool_adapter")
 
     # manager GRPO
-    parser.add_argument("--manager_out", type=str, default="manager_grpo_four")
+    parser.add_argument("--manager_out", type=str, default="manager_grpo_three")
     parser.add_argument("--mgr_bs", type=int, default=1)
     parser.add_argument("--mgr_grad_accum", type=int, default=4)
     parser.add_argument("--mgr_max_prompt_length", type=int, default=2048)
@@ -2859,7 +3067,7 @@ def main():
     parser.add_argument("--fail_buffer_jsonl", type=str, default="")
     parser.add_argument("--raw_trace_jsonl", type=str, default="")
     parser.add_argument("--grpo_use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="agents_as_tools_four_grpo")
+    parser.add_argument("--wandb_project", type=str, default="agents_as_tools_three_grpo")
     parser.add_argument("--wandb_entity", type=str, default="")
     parser.add_argument("--wandb_run_name", type=str, default="")
     parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline"])
@@ -2895,7 +3103,7 @@ def main():
     data_path = resolve_data_path_arg(args.data_path, configured_task)
     if is_main_process():
         print(f"[DATA] {data_path}")
-        print(f"[MODELS] manager={args.manager_base_model} tool={args.tool_base_model}")
+        print(f"[MODELS] manager={args.manager_base_model} default_tool={args.tool_base_model or '[unset]'}")
 
     global MANAGER_SYSTEM
     MANAGER_SYSTEM = build_manager_system_prompt()
@@ -2909,6 +3117,7 @@ def main():
             rows = subsample_rows(rows, max_samples=args.max_samples, seed=sample_seed)
             print(f"[SPLIT] subsampled = {len(rows)}")
         splits = make_splits(rows, test_size=args.test_size, dev_size=args.dev_size, seed=args.seed)
+        splits = attach_split_examples(splits, rows)
         splits["dataset_scope"] = build_split_scope_metadata(data_path, rows)
         write_json(args.split_path, splits)
         print(f"[SPLIT] train/dev/test = {len(splits['train_ids'])}/{len(splits['dev_ids'])}/{len(splits['test_ids'])}")
@@ -2931,15 +3140,23 @@ def main():
     tool_stage_map = {
         "train_fast_solver_tool": ("fast_solver_tool", args.fast_solver_tool_out),
         "train_deep_reasoner_tool": ("deep_reasoner_tool", args.deep_reasoner_tool_out),
-        "train_medical_kb_tool": ("medical_kb_tool", args.medical_kb_tool_out),
         "train_answer_critic_tool": ("answer_critic_tool", args.answer_critic_tool_out),
     }
     if args.stage in tool_stage_map:
+        resolved_tool_base_models = resolve_tool_base_models_for_stage(
+            stage_name=args.stage,
+            default_tool_base_model=args.tool_base_model,
+            fast_solver_base_model=args.fast_solver_base_model,
+            deep_reasoner_base_model=args.deep_reasoner_base_model,
+            answer_critic_base_model=args.answer_critic_base_model,
+        )
+        if is_main_process():
+            print(f"[MODELS][tools] {resolved_tool_base_models}")
         tool_name, out_dir = tool_stage_map[args.stage]
         train_jsonl = os.path.join(args.tool_sft_out_dir, f"{tool_name}_train.jsonl")
         dev_jsonl = os.path.join(args.tool_sft_out_dir, f"{tool_name}_dev.jsonl")
         train_sft_agent(
-            tool_base_model=args.tool_base_model,
+            tool_base_model=resolved_tool_base_models[tool_name],
             train_jsonl=train_jsonl, dev_jsonl=dev_jsonl, out_dir=out_dir,
             seed=args.seed, max_seq_len=args.tool_max_seq_len,
             lr=args.tool_lr, epochs=args.tool_epochs,
@@ -2949,6 +3166,15 @@ def main():
         return
 
     if args.stage == "train_manager_grpo":
+        resolved_tool_base_models = resolve_tool_base_models_for_stage(
+            stage_name=args.stage,
+            default_tool_base_model=args.tool_base_model,
+            fast_solver_base_model=args.fast_solver_base_model,
+            deep_reasoner_base_model=args.deep_reasoner_base_model,
+            answer_critic_base_model=args.answer_critic_base_model,
+        )
+        if is_main_process():
+            print(f"[MODELS][tools] {resolved_tool_base_models}")
         fb = args.fail_buffer_jsonl.strip() or os.path.join(args.manager_out, "fail_buffer.jsonl")
         rt = args.raw_trace_jsonl.strip() or os.path.join(args.manager_out, "train_raw_trace.jsonl")
         train_manager_grpo_from_splits(
@@ -2957,8 +3183,10 @@ def main():
             data_path=data_path, split_path=args.split_path, save_dir=args.manager_out,
             fast_solver_adapter=args.fast_solver_tool_out,
             deep_reasoner_adapter=args.deep_reasoner_tool_out,
-            medical_kb_adapter=args.medical_kb_tool_out,
             answer_critic_adapter=args.answer_critic_tool_out,
+            fast_solver_base_model=resolved_tool_base_models["fast_solver_tool"],
+            deep_reasoner_base_model=resolved_tool_base_models["deep_reasoner_tool"],
+            answer_critic_base_model=resolved_tool_base_models["answer_critic_tool"],
             seed=args.seed,
             per_device_train_bs=args.mgr_bs, grad_accum=args.mgr_grad_accum,
             max_prompt_length=args.mgr_max_prompt_length,
