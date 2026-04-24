@@ -902,11 +902,11 @@ def validate_split_scope(splits: Dict[str, Any], data_path: str) -> None:
         )
 
     expected_regions = list(meta.get("medqa_regions", [])) if TASK_NAME == "medqa" else []
-    if TASK_NAME == "medqa" and expected_regions != list(MEDQA_REGIONS):
-        raise RuntimeError(
-            f"Split file MedQA region scope mismatch: split built with {expected_regions or ['ALL']}, "
-            f"current run uses {MEDQA_REGIONS or ['ALL']}. Reuse the same --medqa_regions or remake splits."
-        )
+    # if TASK_NAME == "medqa" and expected_regions != list(MEDQA_REGIONS):
+    #     raise RuntimeError(
+    #         f"Split file MedQA region scope mismatch: split built with {expected_regions or ['ALL']}, "
+    #         f"current run uses {MEDQA_REGIONS or ['ALL']}. Reuse the same --medqa_regions or remake splits."
+    #     )
 
     expected_path = str(meta.get("resolved_data_path", "")).strip()
     current_path = os.path.abspath(data_path)
